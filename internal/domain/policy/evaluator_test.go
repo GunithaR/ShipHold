@@ -72,13 +72,34 @@ func TestEvaluate(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			result := Evaluate(tt.evidence, policy)
 
-			if result != tt.expected {
+			if result.Decision != tt.expected {
 				t.Fatalf(
 					"expected %q, got %q",
 					tt.expected,
-					result,
+					result.Decision,
 				)
 			}
 		})
+	}
+}
+
+func TestEvaluateReturnReasons(t *testing.T) {
+	policy := Policy{
+		RequireCIPass:          true,
+		RequireImage:           true,
+		RequireImmutableDigest: true,
+		RequireHealthCheck:     true,
+	}
+
+	evidence := readiness.Evidence{}
+
+	result := Evaluate(evidence, policy)
+
+	if result.Decision != readiness.DecisionBlock {
+		t.Fatalf("expected BLOCK, got %q", result.Decision)
+	}
+
+	if len(result.Reasons) != 4 {
+		t.Fatalf("expected 4 reasons, got %d", len(result.Reasons))
 	}
 }
