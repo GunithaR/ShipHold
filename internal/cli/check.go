@@ -16,9 +16,10 @@ func NewCheckCommand() *cobra.Command {
 			provider := git.Provider{}
 			service := check.NewService(provider)
 
-			service.Run()
+			result := service.Run()
 
 			fmt.Println("Check completed")
+			fmt.Println("Evidence:", result)
 		},
 	}
 }

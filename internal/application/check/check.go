@@ -1,7 +1,5 @@
 package check
 
-import "fmt"
-
 type EvidenceProvider interface {
 	Collect() string
 }
@@ -16,8 +14,6 @@ func NewService(provider EvidenceProvider) *Service {
 	}
 }
 
-func (s *Service) Run() {
-	evidence := s.provider.Collect()
-
-	fmt.Println("Evidence:", evidence)
+func (s *Service) Run() string {
+	return s.provider.Collect()
 }
