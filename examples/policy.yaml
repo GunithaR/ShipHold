@@ -1,0 +1,5 @@
+policy:
+  require_ci_pass: true
+  require_image: true
+  require_immutable_digest: true
+  require_healthcheck: true

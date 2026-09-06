@@ -28,7 +28,7 @@ func Evaluate(
 	if len(reasons) > 0 {
 		return EvaluationResult{
 			Decision: readiness.DecisionBlock,
-			Reasons: reasons,
+			Reasons:  reasons,
 		}
 	}
 

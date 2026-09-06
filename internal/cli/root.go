@@ -8,7 +8,7 @@ func NewRootCommand() *cobra.Command {
 		Short: "Git-centric deployment safety and provenance engine",
 	}
 
-	rootCmd.AddCommand(NewCheckCommand())
+	rootCmd.AddCommand(newCheckCommand())
 
 	return rootCmd
 }

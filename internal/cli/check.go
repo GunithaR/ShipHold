@@ -4,22 +4,32 @@ import (
 	"fmt"
 
 	"github.com/GunithaR/ShipHold/internal/application/check"
+	"github.com/GunithaR/ShipHold/internal/config"
 	"github.com/GunithaR/ShipHold/internal/infrastructure/git"
 	"github.com/spf13/cobra"
 )
 
-func NewCheckCommand() *cobra.Command {
+func newCheckCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "check",
-		Short: "Check depoyment readiness",
+		Short: "Check deployment readiness",
 		Run: func(cmd *cobra.Command, args []string) {
+			cfg, err := config.Load("examples/policy.yaml")
+			if err != nil {
+				fmt.Println("Error:", err)
+				return
+			}
+
 			provider := git.Provider{}
 			service := check.NewService(provider)
 
-			result := service.Run()
+			result := service.Run(cfg.Policy)
 
-			fmt.Println("Check completed")
-			fmt.Println("Evidence:", result)
+			fmt.Println("Decision:", result.Decision)
+
+			for _, reason := range result.Reasons {
+				fmt.Println("-", reason)
+			}
 		},
 	}
 }
