@@ -23,7 +23,11 @@ func newCheckCommand() *cobra.Command {
 			provider := git.Provider{}
 			service := check.NewService(provider)
 
-			result := service.Run(cfg.Policy)
+			result, err := service.Run(cfg.Policy)
+			if err != nil {
+				fmt.Println("Error:", err)
+				return
+			}
 
 			fmt.Println("Decision:", result.Decision)
 

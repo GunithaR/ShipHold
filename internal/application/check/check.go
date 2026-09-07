@@ -6,7 +6,7 @@ import (
 )
 
 type EvidenceProvider interface {
-	Collect() readiness.Evidence
+	Collect() (readiness.Evidence, error)
 }
 
 type Service struct {
@@ -19,8 +19,11 @@ func NewService(provider EvidenceProvider) *Service {
 	}
 }
 
-func (s *Service) Run(p policy.Policy) policy.EvaluationResult {
-	evidence := s.provider.Collect()
+func (s *Service) Run(p policy.Policy) (policy.EvaluationResult, error) {
+	evidence, err := s.provider.Collect()
+	if err != nil {
+		return policy.EvaluationResult{}, err
+	}
 
-	return policy.Evaluate(evidence, p)
+	return policy.Evaluate(evidence, p), nil
 }
