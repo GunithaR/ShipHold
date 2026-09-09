@@ -1,6 +1,7 @@
 package check
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/GunithaR/ShipHold/internal/domain/policy"
@@ -13,6 +14,12 @@ type fakeEvidenceProvider struct {
 
 func (f fakeEvidenceProvider) Collect() (readiness.Evidence, error) {
 	return f.evidence, nil
+}
+
+type failingEvidenceProvider struct{}
+
+func (f failingEvidenceProvider) Collect() (readiness.Evidence, error) {
+	return readiness.Evidence{}, errors.New("git unavailable")
 }
 
 func TestServiceRun(t *testing.T) {
@@ -38,5 +45,20 @@ func TestServiceRun(t *testing.T) {
 
 	if result.Decision != readiness.DecisionPass {
 		t.Fatalf("expected PASS, got %q", result.Decision)
+	}
+}
+
+func TestServiceRunReturnsProviderError(t *testing.T) {
+	service := NewService(failingEvidenceProvider{})
+
+	p := policy.Policy{}
+
+	_, err := service.Run(p)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	if err.Error() != "git unavailable" {
+		t.Fatalf("expected git unavailable, got %q", err.Error())
 	}
 }

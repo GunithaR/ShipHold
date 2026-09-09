@@ -44,3 +44,38 @@ func TestProviderCollectOutsideGitRepository(t *testing.T) {
 		t.Fatal("expected error outside Git repository")
 	}
 }
+
+func TestProviderCollectReturnsActualGitEvidence(t *testing.T) {
+	provider := Provider{}
+
+	evidence, err := provider.Collect()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	expectedCommit, err := runGitCommand("rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("get expected commit: %v", err)
+	}
+
+	expectedBranch, err := runGitCommand("branch", "--show-current")
+	if err != nil {
+		t.Fatalf("get expected branch: %v", err)
+	}
+
+	if evidence.GitCommitSHA != expectedCommit {
+		t.Fatalf(
+			"expected commit %q, got %q",
+			expectedCommit,
+			evidence.GitCommitSHA,
+		)
+	}
+
+	if evidence.Branch != expectedBranch {
+		t.Fatalf(
+			"expected branch %q, got %q",
+			expectedBranch,
+			evidence.Branch,
+		)
+	}
+}
