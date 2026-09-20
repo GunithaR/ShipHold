@@ -5,15 +5,11 @@ import (
 	"github.com/GunithaR/ShipHold/internal/domain/readiness"
 )
 
-type EvidenceProvider interface {
-	Collect() (readiness.Evidence, error)
-}
-
 type Service struct {
-	provider EvidenceProvider
+	provider readiness.Provider
 }
 
-func NewService(provider EvidenceProvider) *Service {
+func NewService(provider readiness.Provider) *Service {
 	return &Service{
 		provider: provider,
 	}

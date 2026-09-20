@@ -1,44 +1,44 @@
 # ShipHold — Architecture
 
+> **How to read this document.** It describes the system's structure and the boundaries that hold it together. Individual decisions — what was chosen, what was rejected, and why — live in `docs/adr/`, and are cross-referenced throughout. The schedule lives in `docs/roadmap.md`. This document should describe what is true now; where it describes something not yet built, that is marked.
+
+---
+
 ## 1. Purpose
 
 ShipHold is a Go-based deployment safety and provenance system for small and medium teams using Git, CI, container registries, and Docker-based deployment environments.
 
-The name reflects two intentional meanings: **hold** as a controlled pause before a deployment proceeds (the safety gate), and **hold** as the cargo compartment of a ship where goods are secured and inspected before transit (the provenance and audit trail). See ADR-000 for the naming rationale.
+The name carries two meanings: **hold** as a controlled pause before a deployment proceeds (the safety gate), and **hold** as the cargo compartment of a ship where goods are secured and inspected before transit (the provenance trail). See [ADR-000](adr/ADR-000-naming.md).
 
-Its purpose is to make deployment state transitions:
+Its purpose is to make deployment state transitions verifiable before deployment, controlled during deployment, observable after deployment, auditable over time, and reversible when necessary.
 
-- verifiable before deployment,
-- controlled during deployment,
-- observable after deployment,
-- auditable over time,
-- and reversible when necessary.
-
-The system is intentionally designed as a foundation that can later expand into Kubernetes/GitOps adapters, additional CI providers, registries, and optional AI explanations without rewriting the core.
+The system is designed as a foundation that can later extend to Kubernetes, additional CI providers, and additional registries without rewriting the core.
 
 ---
 
-## 2. Core Engineering Principle
+## 2. Core engineering principle
 
 > A deployment is a state transition. Make that transition verifiable, auditable, and reversible.
 
-The system separates:
+The system separates seven concerns, and the separations are load-bearing rather than descriptive:
 
-1. **Evidence collection** — what is true about the proposed deployment?
-2. **Evaluation** — what do policies say about that evidence?
-3. **Decision** — PASS, WARN, or BLOCK.
-4. **Execution** — perform the deployment only when permitted.
-5. **Verification** — confirm that the resulting state is healthy.
-6. **Provenance** — persist exactly what happened.
-7. **Recovery** — restore a previously known-good deployment state.
+```text
+1. Evidence collection   what is true about the proposed deployment?
+2. Evaluation            what do the policies say about that evidence?
+3. Decision              PASS, WARN, or BLOCK
+4. Execution             deploy only when permitted
+5. Verification          confirm the resulting state is healthy
+6. Provenance            record exactly what happened, tamper-evidently
+7. Recovery              restore a previously recorded known-good state
+```
+
+Steps 1–3 are pure and reproducible. Given the same evidence and the same policy, evaluation returns the same decision forever — which is what makes a provenance record independently checkable months later, by anyone, with no network access. Everything in this document that looks like extra ceremony exists to protect that property.
 
 ---
 
-## 3. Product Boundary
+## 3. Product boundary
 
-The product is not intended to replace GitHub Actions, Docker, Kubernetes, Terraform, Prometheus, or incident-management platforms.
-
-It sits around existing delivery infrastructure as a deployment safety layer.
+ShipHold does not replace GitHub Actions, Docker, Kubernetes, Terraform, Prometheus, or incident-management platforms. It sits around existing delivery infrastructure as a safety layer.
 
 ```text
 Git
@@ -48,13 +48,13 @@ CI/CD
  │
  ▼
 ┌──────────────────────────┐
-│ ShipHold │
+│         ShipHold         │
 ├──────────────────────────┤
 │ Readiness                │
-│ Diff / Policy            │
+│ Policy                   │
 │ Deployment               │
 │ Verification             │
-│ Audit / Provenance       │
+│ Provenance               │
 │ Rollback                 │
 └────────────┬─────────────┘
              │
@@ -62,1235 +62,684 @@ CI/CD
         Reverse Proxy
              │
              ▼
-          Docker
+           Docker
              │
              ▼
-       Running Service
+      Running Service
 ```
 
-The initial target is a single-host Docker-based deployment environment, optionally using Docker Compose, with a lightweight reverse proxy such as Traefik. Kubernetes is a future deployment adapter, not a v1 requirement.
+The initial target is a single-host Docker environment with Traefik. Kubernetes is a future deployment adapter, not a v1 requirement.
 
-GitHub/GitHub Actions is the initial CI integration. A full GitHub App is not required for the core v1 architecture. If future capabilities require repository installation, webhooks, PR checks, or similar functionality, a GitHub App can be introduced behind the appropriate provider boundary.
+GitHub Actions is the initial CI integration, via its REST API. A full GitHub App is not required for v1 and is deferred ([`extended-scope.md`](extended-scope.md) §3.1).
+
+### What ShipHold is not
+
+Not a GitOps controller, a Kubernetes platform, a CI system, a container orchestrator, a reverse proxy, a monitoring platform, an incident-response tool, or an AI system making deployment decisions. The last of these is a firm architectural boundary, not a current limitation — see [ADR-015](adr/ADR-015-ai-as-explanation-layer.md).
 
 ---
 
-## 4. Architectural Goals
+## 4. Architectural goals
 
 ### 4.1 Primary goals
 
-- Keep deployment decisions deterministic.
-- Keep external systems behind explicit interfaces.
+- Keep deployment decisions deterministic and reproducible from recorded evidence.
+- Keep external systems behind narrow, consumer-declared interfaces.
 - Keep domain logic independent of Docker, GitHub, PostgreSQL, and vendor SDKs.
-- Make deployment state durable and reconstructable.
+- Make deployment state durable, reconstructable, and tamper-evident.
 - Preserve known-good state during failed deployments.
-- Make failure handling explicit.
-- Make the system easy to test without requiring real infrastructure for every test.
-- Use real infrastructure integration tests where mocks are insufficient.
-- Make future deployment targets and providers replaceable.
-- Maintain documentation and architecture records throughout development.
-- Keep the first release narrow enough to complete within three months of part-time development.
+- Make failure handling explicit — every failure mode has a state, an exit code, and a record.
+- Make the system testable without infrastructure for the great majority of its behaviour.
+- Use real infrastructure integration tests only where mocks give insufficient confidence.
+- Fail closed: when a required condition cannot be verified, refuse.
 
 ### 4.2 Non-goals
 
-- Building a reverse proxy.
-- Building a Kubernetes platform.
-- Building a monitoring platform.
-- Building an incident-response/RCA platform.
-- Replacing CI/CD.
-- Building an infrastructure-provisioning engine.
-- Building a custom policy language.
-- Making AI responsible for deployment decisions.
-- Building a full GitHub App unless a concrete v1 capability requires it.
+Building a reverse proxy, a Kubernetes platform, a monitoring platform, an incident-response tool, a CI system, an infrastructure-provisioning engine, or a custom policy language. Making AI responsible for any part of a deployment decision.
 
 ---
 
-## 5. Initial Technical Decisions
+## 5. Layered architecture
 
-The following decisions are deliberately made early because they remove major implementation uncertainty.
-
-### 5.1 Docker traffic switching
-
-A reverse proxy owns the public application endpoint.
-
-The deployment engine does not expose each application version on the same host port.
-
-Conceptually:
+Four layers, dependencies flowing one way only. See [ADR-001](adr/ADR-001-layered-architecture.md).
 
 ```text
-                    ┌── API v1
-                    │
-Client → Proxy ─────┤
-                    │
-                    └── API v2
+cmd/shiphold/              binary; exit codes; one os.Exit
+  │
+  ▼
+internal/cli/              parse flags, render results, map errors to exit codes
+  │
+  ▼
+internal/application/      orchestration; DECLARES the ports it needs
+  │
+  ▼
+internal/domain/           types and rules; imports stdlib only
+  ▲
+  │  implements
+internal/infrastructure/   concrete adapters; returns domain types
 ```
 
-The proxy is responsible for routing.
+**On ports.** An earlier draft of this document described `Ports / Interfaces` as a layer sitting between domain and infrastructure. That is a faithful translation of hexagonal architecture from languages with explicit interface implementation, and it translates badly to Go. Go interfaces are satisfied implicitly, and the idiom is that **the consumer declares the interface it needs, in its own package, as narrowly as possible**. A central ports package produces wide interfaces shaped by what implementations offer rather than by what callers need, and creates a package every layer must import.
 
-The Go deployment engine is responsible for:
+So: `application/check` declares the collector interfaces it consumes; `application/deploy` declares the deployment-target and router interfaces it consumes. There is no ports package. This is what the code already does; the document now matches it.
 
-- starting the new version,
-- verifying its health,
-- switching the active route,
-- verifying the switched traffic,
-- stopping the old version,
-- recording the deployment.
+**The dependency rule is checked in CI**, not merely stated — see ADR-001 for the two `go list` invocations that enforce it. A rule that lives only in a document is broken by month two.
 
-Traefik is the preferred initial implementation because of its Docker integration and label-based routing.
+### Layer responsibilities
 
-Caddy or another reverse proxy may be substituted if the technical spike shows a better fit.
+**`cmd/`** — constructs the composition root, runs the root command, maps the returned error to an exit code, calls `os.Exit` exactly once. Never panics.
 
-The project does not implement its own proxy.
+**`internal/cli/`** — flag parsing, result rendering (text and JSON), and error-to-exit-code translation, done once in a shared wrapper rather than repeated per command. Contains no business logic: no policy rules, no retry loops, no state transitions. All commands use `RunE`.
 
-### 5.2 Policy engine
+**`internal/application/`** — orchestration. `CheckService`, `DeployService`, `RollbackService`, `HistoryService`, `VerifyService`. Coordinates domain operations and the ports it declares. Holds no rules of its own.
 
-The initial policy system is deliberately simple.
+**`internal/domain/`** — `deployment`, `readiness`, `policy`, `provenance`. Standard library only: no YAML tags, no DB tags, no SDK types. Serialisation happens at the boundaries.
 
-Policies are represented by typed YAML configuration and evaluated by deterministic Go rules.
+**`internal/infrastructure/`** — `git`, `github`, `registry`, `docker`, `proxy`, `postgres`, `filestore`. Each adapter returns domain types and classifies its own errors ([ADR-004](adr/ADR-004-errors-and-exit-codes.md)).
 
-No custom DSL.
-No generic expression language.
-No complex AST parser.
+### Composition root
 
-Example:
-
-```yaml
-policy:
-  require_ci_pass: true
-  require_image: true
-  require_immutable_digest: true
-  require_healthcheck: true
-```
-
-Future policy complexity can be added only if real use cases justify it.
-
-### 5.3 Integration testing
-
-Unit tests remain fast and isolated.
-
-Real infrastructure behavior is tested through integration tests using `testcontainers-go` where appropriate.
-
-Initial integration targets include:
-
-- PostgreSQL,
-- Docker/container lifecycle behavior where practical,
-- supporting test infrastructure.
-
-External GitHub API behavior should use contract/integration tests carefully, avoiding dependence on a personal developer token for the normal test suite.
-
-The default CI suite should run without requiring manually configured external credentials.
-
-### 5.4 Deployment state and idempotency
-
-Deployment is a stateful operation and must explicitly handle interrupted execution.
-
-The design must consider:
-
-- duplicate deployment requests,
-- process interruption,
-- Docker daemon failure,
-- proxy failure,
-- health-check timeout,
-- persistence failure,
-- partial deployment state.
-
-Deployment operations should be designed to be as idempotent as practical.
+Dependencies are wired in exactly one place, `internal/cli/deps.go`, written **before the second command exists**. Hand-wiring inside command closures — which the current `check` command does — is how a "someday" cleanup accumulates for eight commands.
 
 ---
 
-## 6. Layered Architecture
+## 6. Repository structure
 
-The preferred architecture is:
-
-```text
-CLI
- │
- ▼
-Application Services
- │
- ▼
-Domain
- │
- ▼
-Ports / Interfaces
- │
- ▼
-Infrastructure Adapters
-```
-
-### CLI
-
-Responsible for:
-
-- parsing arguments,
-- formatting output,
-- mapping user commands to application services,
-- translating application errors into user-facing messages.
-
-The CLI must not contain deployment business logic.
-
-### Application layer
-
-Responsible for orchestration.
-
-Examples:
-
-- `CheckService`
-- `DiffService`
-- `DeploymentService`
-- `RollbackService`
-- `HistoryService`
-
-The application layer coordinates domain operations and external ports.
-
-### Domain layer
-
-Contains the core concepts and rules:
-
-- Deployment
-- DeploymentDiff
-- ReadinessCheck
-- ReadinessResult
-- ReadinessDecision
-- DeploymentPolicy
-- HealthCheck
-- DeploymentEvent
-- DeploymentArtifact
-- RollbackRequest
-
-The domain should not import Docker SDKs, GitHub clients, database drivers, etc.
-
-### Infrastructure layer
-
-Contains concrete implementations:
-
-- local Git adapter
-- GitHub Actions adapter
-- GHCR adapter
-- Docker adapter
-- Traefik/proxy adapter or deployment-routing adapter
-- PostgreSQL repository
-- filesystem/configuration adapter
-
----
-
-## 7. Proposed Repository Structure
-
-The exact structure may evolve as implementation teaches us more.
-
-The initial boundary should be:
-
-> Module path is a placeholder until the repository is created: `github.com/<username>/shiphold`. Replace `<username>` throughout `go.mod` and import paths once the GitHub repo exists.
+Module path: `github.com/GunithaR/ShipHold`. (Mixed case is a known wart, accepted rather than changed — see [ADR-002](adr/ADR-002-go-and-cobra.md). The binary, the command, and all prose are lowercase `shiphold`.)
 
 ```text
 shiphold/
-├── cmd/
-│   └── shiphold/
-│       └── main.go
+├── cmd/shiphold/main.go
 │
 ├── internal/
 │   ├── domain/
-│   │   ├── deployment/
-│   │   ├── readiness/
-│   │   ├── policy/
-│   │   ├── configuration/
-│   │   └── audit/
+│   │   ├── deployment/     Deployment, Status, Event, Environment, transitions
+│   │   ├── readiness/      Evidence, Decision, per-source evidence types
+│   │   ├── policy/         Policy, Rule, RuleResult, Evaluate
+│   │   └── provenance/     Record, canonical serialisation, hash chain
 │   │
 │   ├── application/
-│   │   ├── check/
-│   │   ├── diff/
-│   │   ├── deploy/
+│   │   ├── check/          readiness orchestration; declares collector ports
+│   │   ├── deploy/         deployment orchestration; declares target + router ports
 │   │   ├── rollback/
-│   │   └── history/
+│   │   ├── history/
+│   │   └── verify/         ledger chain verification
 │   │
 │   ├── infrastructure/
-│   │   ├── git/
-│   │   ├── github/
-│   │   ├── registry/
-│   │   ├── docker/
-│   │   ├── proxy/
-│   │   └── postgres/
+│   │   ├── git/            local Git evidence
+│   │   ├── github/         GitHub Actions CI evidence
+│   │   ├── registry/       digest resolution
+│   │   ├── docker/         container lifecycle
+│   │   ├── proxy/          Traefik file-provider router
+│   │   ├── postgres/       repository + lock
+│   │   └── filestore/      JSON-Lines repository + flock
 │   │
-│   ├── config/
-│   └── logging/
+│   ├── cli/                commands, renderers, composition root
+│   ├── config/             load, validate, hash, discover
+│   ├── secret/             Secret type; reference resolution
+│   └── shiphold/           error kinds, sentinels, exit codes
 │
 ├── tests/
-│   ├── integration/
-│   └── e2e/
+│   ├── integration/        build-tagged; needs Docker
+│   └── e2e/                full topology via Docker Compose fixture
 │
 ├── docs/
-│   ├── architecture/
+│   ├── architecture.md
+│   ├── vision.md
+│   ├── roadmap.md
+│   ├── extended-scope.md
 │   ├── adr/
 │   ├── development/
-│   ├── operations/
-│   └── decisions/
+│   └── operations/
 │
 ├── examples/
-├── .github/
-│   └── workflows/
-├── README.md
-├── go.mod
-└── go.sum
+├── .github/workflows/
+├── CONTRIBUTING.md
+├── LICENSE
+├── Makefile
+└── go.mod
 ```
 
-**Do not create every package merely because it appears in this diagram.**
-
-Packages should be created when the corresponding capability or boundary actually exists.
-
-The repository structure is a design guide, not an implementation checklist.
+**Create packages when the capability exists, not because they appear here.** This is a design guide, not a checklist.
 
 ---
 
-## 8. Core Domain Model
-
-The initial domain vocabulary should include:
+## 7. Core domain model
 
 ```text
-Deployment
-DeploymentStatus
-DeploymentResult
+Environment          a validated, declared deployment environment  (ADR-013)
 
-DeploymentArtifact
-DeploymentConfiguration
+Evidence             what is true, per source, with availability   (ADR-005)
+  ├── GitEvidence
+  ├── CIEvidence
+  ├── ImageEvidence
+  └── ConfigEvidence
 
-ReadinessCheck
-ReadinessResult
-ReadinessDecision
+Policy               rules and severities, scoped per environment  (ADR-006)
+Rule / RuleID        a named, pure predicate over evidence
+RuleResult           SATISFIED | VIOLATED | UNKNOWN | SKIPPED      (ADR-003)
+EvaluationResult     decision + rule results + policy digest
+Decision             PASS | WARN | BLOCK
 
-DeploymentDiff
-DeploymentPolicy
+Deployment           identity, environment, digests, event log     (ADR-007)
+Status               lifecycle state
+Event                an appended, immutable transition record
 
-HealthCheck
-HealthResult
+HealthCheckConfig    endpoint, interval, timeout, threshold
+HealthProbeResult    the outcome of probing a running candidate
 
-DeploymentEvent
-RollbackRequest
+Record               the provenance record, hash-chained           (ADR-009)
 ```
 
-The proxy should generally remain an infrastructure concern. Domain logic should express concepts such as "activate deployment" rather than Traefik-specific labels.
+### Two concepts that were previously one
 
-### Readiness decision
+The earlier model had a single `HealthCheck` notion, and the policy evaluator emitted `"health check is invalid"`. These are two different things at two different times:
 
-The decision should be a domain type:
+- **`HealthCheckConfigured`** — pre-deployment evidence. Is a health check defined and well-formed? Feeds policy evaluation.
+- **`HealthProbeResult`** — deploy-time fact, produced after a candidate container starts. Feeds the state machine.
 
-```text
-PASS
-WARN
-BLOCK
-```
+Keeping one name for both would have caused confusion precisely at the point where the deploy path is written.
 
-The result should contain evidence and reasons rather than only a boolean.
+### Deployment identity is the digest
 
-Conceptually:
-
-```text
-ReadinessResult
-├── checks
-├── warnings
-├── blocking reasons
-├── policy evaluation
-└── decision
-```
+`ImageRef` records what the human asked for. `ImageDigest` records what was actually deployed, and it is the identity. A mutable tag may point somewhere else entirely by the time a record is read, which is the failure mode immutable digests exist to prevent.
 
 ---
 
-## 9. Evidence → Evaluation → Decision
+## 8. Evidence → Evaluation → Decision
 
-This is one of the most important architectural boundaries.
+The central boundary of the architecture.
 
 ```text
 External systems
+      │        (narrow collectors, concurrent, context-bounded)
+      ▼
+Evidence                          ← may be marked UNAVAILABLE per source
+      │        (pure function, no I/O, injected clock)
+      ▼
+Policy evaluation
       │
       ▼
-Evidence
-      │
-      ▼
-Policy / Evaluation
-      │
-      ▼
-PASS / WARN / BLOCK
+PASS / WARN / BLOCK   +  per-rule results  +  policy digest
 ```
 
-For example:
+### Collection: narrow, concurrent, and honest about failure
+
+Each source is its own small interface declared by `application/check` ([ADR-005](adr/ADR-005-evidence-collection.md)). Collectors run concurrently under a total time budget, each taking a `context.Context`.
+
+**An unreachable source produces evidence marked unavailable, not an error that aborts the check.** This is the design's most consequential small decision. An unreachable GitHub yields:
 
 ```text
-Git commit = 8f91a22
-CI status = PASS
-Image exists = true
-Image digest = sha256:abc...
-Health endpoint configured = true
+BLOCK
+
+  ✗ ci_passed         UNKNOWN    CI status could not be determined:
+                                 GitHub API returned 403
+  ✓ image_present     SATISFIED  ghcr.io/acme/payments-api:v2.1.0
+  ✓ immutable_digest  SATISFIED  sha256:9f2c1a…
+  ✓ healthcheck       SATISFIED  GET /health, timeout 60s
 ```
 
-becomes evidence.
+rather than a stack trace. The operator learns that three of four conditions hold and exactly which one could not be established. Aborting on the first error tells them nothing.
 
-A policy may then evaluate:
+### Evaluation: pure, tri-state, fail-closed
 
-```text
-CI must pass       ✓
-Image must exist   ✓
-Digest required    ✓
+```go
+func Evaluate(ev readiness.Evidence, p Policy, at time.Time) EvaluationResult
 ```
 
-and produce:
+No I/O, no clock read, no logging, no error return. Rules are configured `block`, `warn`, or `off`; each produces a `RuleResult`; the decision is the maximum severity observed ([ADR-003](adr/ADR-003-readiness-decision-model.md)).
 
-```text
-PASS
-```
+**`UNKNOWN` on a blocking rule produces `BLOCK`.** A safety tool that cannot verify a required condition refuses. Failing closed on missing evidence is the product's whole posture, and it belongs in the decision table rather than in an adapter's error handling.
 
-The Docker deployment engine must not independently invent its own readiness logic.
+The deployment engine never invents its own readiness logic. It receives a decision.
 
 ---
 
-## 10. Provider Interfaces
+## 9. Configuration and policy
 
-External systems should be represented through narrow interfaces.
+Typed YAML, strictly parsed, environment-scoped. See [ADR-006](adr/ADR-006-typed-yaml-policy.md).
 
-### Git
+```yaml
+version: 1
 
-```text
-GitProvider
+application:
+  name: payments-api
+
+environments:
+  staging:
+    target: docker
+    health: { endpoint: /health, timeout: 60s, interval: 2s, failure_threshold: 3 }
+    rules:
+      ci_passed:              block
+      image_present:          block
+      immutable_digest:       warn
+      healthcheck_configured: block
+
+  production:
+    target: docker
+    health: { endpoint: /health, timeout: 120s, interval: 2s, failure_threshold: 3 }
+    rules:
+      ci_passed:              block
+      image_present:          block
+      immutable_digest:       block
+      healthcheck_configured: block
+
+registry:
+  url: ghcr.io
+  credentials: env:GHCR_TOKEN        # a reference, never a value
+
+provenance:
+  backend: file                      # file | postgres
+  path: ./.shiphold/ledger.jsonl
 ```
 
-Initial implementation:
+Four properties this shape commits to:
 
-```text
-LocalGitProvider
-```
+**Unknown keys are rejected.** `yaml.Decoder` with `KnownFields(true)`. Previously, a typo such as `require_ci_pas` parsed silently and disabled the rule — **a policy typo failed open**, which in a safety tool is a correctness defect rather than a papercut.
 
-### CI
+**`version` is mandatory.** The format will change; migration requires knowing what you are migrating from.
 
-```text
-CIProvider
-```
+**Rules are scoped per environment.** Production requiring more evidence than staging is the core use case ([ADR-013](adr/ADR-013-environments.md)).
 
-Initial:
+**Credentials are references.** Policy files live in Git ([ADR-012](adr/ADR-012-secrets.md)).
 
-```text
-GitHubActionsProvider
-```
+**The document is hashed on load**, and the digest is recorded in provenance — so the audit trail can answer *under which version of the rules was this permitted?*
 
-### Registry
+Discovery order: `--config`, `SHIPHOLD_CONFIG`, `./shiphold.yaml`, `./.shiphold/config.yaml`.
 
-```text
-RegistryProvider
-```
-
-Initial:
-
-```text
-GHCRProvider
-```
-
-### Deployment
-
-```text
-DeploymentTarget
-```
-
-Initial:
-
-```text
-DockerDeploymentTarget
-```
-
-### Traffic routing
-
-The deployment target may depend on a routing abstraction rather than directly manipulating Traefik.
-
-Conceptually:
-
-```text
-TrafficRouter
-└── TraefikRouter
-```
-
-This keeps the deployment service independent from the chosen proxy.
-
-### Persistence
-
-```text
-DeploymentRepository
-```
-
-Initial:
-
-```text
-PostgreSQLDeploymentRepository
-```
-
-This prevents vendor implementations from spreading into business logic.
+Rules are Go predicates registered by `RuleID`. No DSL, no embedded scripting, no expression evaluation.
 
 ---
 
-## 11. Docker + Reverse Proxy Deployment Model
+## 10. Errors and exit codes
 
-The v1 deployment topology is:
+In CI, **the exit code is the API**. See [ADR-004](adr/ADR-004-errors-and-exit-codes.md).
+
+| Code | Meaning |
+| --- | --- |
+| `0` | PASS |
+| `1` | WARN (non-zero by default; `--warn-exit-code` to change) |
+| `2` | BLOCK |
+| `3` | Configuration error |
+| `4` | Evidence error (a required source unreachable) |
+| `5` | Deployment failure (previous version preserved) |
+| `6` | Conflict (lock held, duplicate deployment) |
+| `7` | Provenance failure (write failed, or chain broken) |
+| `70` | Internal error |
+
+**A policy BLOCK is not an error.** It is a successful evaluation with a negative result, returned as a valid `EvaluationResult` with a `nil` error. If `BLOCK` and "GitHub returned 500" shared a path, neither CI nor an operator could tell *"we checked and the answer is no"* from *"we could not check"* — and that confusion is how a gate ends up disabled.
+
+Errors carry a `Kind`, an operation, a wrapped cause, and an optional actionable hint. Sentinels support `errors.Is`. No command calls `os.Exit` or prints an error; each returns one, and a single wrapper translates it.
+
+---
+
+## 11. Docker and reverse-proxy deployment model
+
+**Status: provisional.** The traffic-switching mechanism is [ADR-008](adr/ADR-008-traffic-switching.md), which is `Proposed` pending the Week-1 spike. Build nothing load-bearing on this section until that ADR is promoted.
 
 ```text
                     Public Endpoint
                           │
                           ▼
                    ┌────────────┐
-                   │   Traefik  │
+                   │   Traefik  │   ← owns the host port
                    └─────┬──────┘
                          │
                ┌─────────┴─────────┐
                ▼                   ▼
-          API v1 (blue)       API v2 (green)
+          v1 (active)         v2 (candidate)
 ```
 
-Only the proxy owns the host/public port.
+Only the proxy owns the public port. Application containers communicate over the Docker network and do not bind application ports to the host.
 
-Application containers communicate through the Docker network and are not required to bind their application port directly to the host.
+### The routing abstraction
+
+The deployment domain never mentions Traefik. It depends on a `TrafficRouter` port with `Activate`, `Active`, and `Verify`. Nothing in `domain/` or `application/` references a label, a weight, or a file path. Substituting Caddy or nginx is one new adapter.
 
 ### Deployment sequence
 
 ```text
-1. Validate readiness
-2. Create deployment record
-3. Start new container
-4. Wait for startup
-5. Run health/readiness checks
-6. Activate new route
-7. Verify traffic through proxy
-8. Stop old container
-9. Persist successful deployment state
+1. Reconcile any interrupted prior deployment        (ADR-011)
+2. Acquire the (application, environment) lock       (ADR-011)
+3. Evaluate readiness                                (ADR-003)
+4. Create the deployment record
+5. Start the candidate container — not routed
+6. Health-probe the candidate DIRECTLY
+7. If unhealthy → remove candidate, previous untouched, record FAILED, exit 5
+8. Activate the route, carrying the fencing token
+9. Wait for the router to report configuration loaded
+10. VERIFY THROUGH THE PROXY
+11. If verification fails → revert, re-verify previous, remove candidate, record FAILED
+12. Stop the previous container
+13. Append the provenance record                     (ADR-009)
 ```
 
-### Failed deployment
+Steps 6 and 10 are deliberately different checks. Step 6 asks *is this build healthy*; step 10 asks *did the routing change take effect*. Conflating them hides the class of bug where the application is fine and the proxy points at the wrong place.
+
+### What "verify routed traffic" means
+
+Previously undefined, which made it unimplementable and untestable. The predicate:
 
 ```text
-1. Start new container
-2. Health check fails
-3. Do not activate route
-4. Remove failed container
-5. Keep old container serving traffic
-6. Record failure
+Send N requests (default 10) to the public endpoint through the proxy,
+over a window of at most T (default 10s).
+
+PASS  if all N return < 500 AND a response marker identifies the candidate.
+FAIL  otherwise.
 ```
 
-This is the initial blue/green-style deployment strategy.
+The identifying marker is the essential half. Without it, verification passes when the proxy is still serving the *old* version perfectly well — the requests succeed and nothing has switched. ShipHold injects `X-ShipHold-Deployment: <id>` via router middleware, or reads an application-provided build identifier.
+
+### Failure path
+
+```text
+Candidate starts → health check fails → route never activated
+→ previous version continues serving 100% of traffic
+→ candidate removed → failure recorded with reasons
+```
+
+The previous version is never stopped before the candidate is verified through the proxy.
 
 ---
 
-## 12. Reverse Proxy Technical Spike
+## 12. Deployment lifecycle
 
-Because traffic switching is a critical implementation dependency, it must be proven before the main deployment engine is built around it.
-
-Early spike:
+See [ADR-007](adr/ADR-007-deployment-lifecycle.md).
 
 ```text
-Docker network
-├── Traefik
-├── sample-app:v1
-└── sample-app:v2
+              REQUESTED
+                  │
+                  ▼
+              VALIDATING
+                  │
+           ┌──────┴──────┐
+           ▼             ▼
+        BLOCKED        READY
+                         │
+                         ▼
+                    DEPLOYING
+                    │       │
+           ┌────────┘       └────────┐
+           ▼                         ▼
+       VERIFYING                  FAILED
+        │      │                     │
+   ┌────┘      └────┐                │
+   ▼                ▼                │
+SUCCEEDED        FAILED ◄─────────────┘
+                    │
+                    ▼
+              ROLLING_BACK
+                 │      │
+         ┌───────┘      └───────┐
+         ▼                      ▼
+   ROLLED_BACK           ROLLBACK_FAILED
+
+  INTERRUPTED ← reachable from any non-terminal state; recovery resolves it
 ```
 
-Prove:
+Terminal: `SUCCEEDED`, `BLOCKED`, `ROLLED_BACK`, `ROLLBACK_FAILED`.
 
-```text
-v1 active
-  ↓
-start v2
-  ↓
-health-check v2
-  ↓
-route traffic to v2
-  ↓
-verify v2
-  ↓
-stop v1
-```
+**`ROLLED_BACK` is distinct from `SUCCEEDED`.** A deployment that had to be rolled back did not succeed, and an audit trail recording it as success is lying by omission.
 
-Also prove failure:
+**Transitions append events; they do not overwrite a field.** `TransitionTo(to, reason, at)` validates against the table, appends an immutable `Event`, and updates the cached status. The deployment can therefore narrate its own history, which is what an auditable system requires and what a mutable status field cannot provide.
 
-```text
-v2 starts
-  ↓
-health-check fails
-  ↓
-v1 remains active
-  ↓
-v2 removed
-```
+Time is injected rather than read, so records are reproducible in tests — a requirement of the hash chain.
 
-If Traefik introduces unacceptable complexity, the routing adapter can be changed before the deployment domain is coupled to it.
+The transition table is pure domain logic with no dependencies and should be exhaustively tested: every ordered pair of states asserted valid or invalid. If any part of this codebase is proved rather than merely tested, this is the part.
 
 ---
 
-## 13. Deployment Lifecycle
+## 13. Concurrency, locking and recovery
 
-The deployment lifecycle should be explicit.
+See [ADR-011](adr/ADR-011-concurrency-and-recovery.md). Previously this document listed these as things the design "must consider"; it now specifies them.
 
-```text
-REQUESTED
-    │
-    ▼
-VALIDATING
-    │
-    ▼
-READY / BLOCKED
-    │
-    ▼
-DEPLOYING
-    │
-    ▼
-VERIFYING
-    │
- ┌──┴────┐
- ▼       ▼
-SUCCESS  FAILED
-```
+**Locking.** A lease on `(application, environment)` — `flock` with the file backend, `pg_try_advisory_lock` with PostgreSQL. Non-blocking by default: a concurrent deployment fails fast with exit 6 and names the holder. `--wait` opts into queuing. In CI, a silent wait is indistinguishable from a hang.
 
-Additional operational states may be introduced when implementation requires them, such as:
+**Fencing tokens.** Every lease carries a monotonic token, written into router configuration and the deployment record. A stalled process that wakes after its lease expired is refused rather than allowed to write configuration computed before the current deployment existed. Not exotic for a tool that runs on CI runners, which are routinely throttled and suspended.
 
-```text
-ROLLING_BACK
-ROLLBACK_FAILED
-INTERRUPTED
-```
+**Startup reconciliation.** Before acquiring the lock, `deploy` and `rollback` check for a non-terminal record with no live holder, observe actual container and router state, and reconcile — **preferring the safe state over the intended one**. When observed state is ambiguous, ShipHold records `INTERRUPTED`, reports exactly what it saw, and stops. Automated recovery from a state the tool does not understand is how a partial outage becomes a full one.
 
-Do not prematurely model dozens of states.
+**Request idempotency.** A deploy keyed on `(application, environment, image digest, config digest)` that matches the current successful state is a no-op with a message, not a redeploy. This makes re-running a CI job safe, which is the most common way this command gets invoked twice.
 
 ---
 
-## 14. Health-Gated Deployment
+## 14. Provenance
 
-The deployment engine must never immediately replace the currently active version.
+See [ADR-009](adr/ADR-009-provenance-integrity.md).
 
-The proxy maintains the public endpoint.
+Every deployment produces one record, written once, never updated: identity, environment, commit, CI run, image reference **and digest**, config digest, **policy digest**, full evidence, rule-level decision, the complete event log, outcome, timings, actor, and the ShipHold version that wrote it.
+
+### The records form a hash chain
 
 ```text
-Active v1
-   │
-   ▼
-Start v2
-   │
-   ▼
-Health verification
-   │
- ┌─┴────┐
- ▼      ▼
-PASS   FAIL
- │      │
- ▼      ▼
-Switch Keep v1
-route   active
- │
- ▼
-Verify routed traffic
- │
- ▼
-Stop v1
+Record 1:  PrevHash = ""          RecordHash = H(canonical(r1) || "")
+Record 2:  PrevHash = r1.Hash     RecordHash = H(canonical(r2) || r1.Hash)
+Record 3:  PrevHash = r2.Hash     RecordHash = H(canonical(r3) || r2.Hash)
 ```
 
-The exact proxy configuration is an infrastructure detail.
+Altering record 2 breaks record 3's `PrevHash` and every link after it. `shiphold verify` detects it in one pass and names the first broken link.
 
-The deployment domain only needs to know whether activation and verification succeeded.
+This is what makes "auditable provenance trail" a supportable claim. Without it, the trail is rows in a database that anyone with access can edit — and an audit log that can be silently rewritten is a log, not an audit trail. The cost is roughly two days: canonical serialisation with golden tests, chain construction, the `verify` command, and database triggers.
+
+Append-only is enforced rather than intended: the repository port has no `Update` and no `Delete`; PostgreSQL has a trigger that raises on either; the file backend opens `O_APPEND`. `Seq` is dense and gapless, so a deleted record is as detectable as an altered one.
+
+### Honest limits
+
+Worth being able to state precisely. v1 **detects** record-level tampering; it does not prevent it. A full-database rewrite — recomputing every hash from record 1 — is not detected; external anchoring of the chain head closes that and is deferred ([`extended-scope.md`](extended-scope.md) §1.2). There is no authenticity property; that requires signing (§1.1).
 
 ---
 
-## 15. Deployment Provenance
+## 15. Rollback
 
-Every deployment should have a durable identity.
-
-A deployment record should capture enough information to answer:
-
-> What exactly was deployed?
-
-At minimum:
+Rollback is a **new forward deployment** that restores a previously recorded state. It never rewrites history.
 
 ```text
-Deployment ID
-Application
-Git commit SHA
-Branch
-CI run
-Image reference
-Image digest
-Configuration version
-Readiness result
-Policy decision
-Start time
-End time
-Deployment result
-Health verification
-Events/errors
+Deployment 184  (succeeded)
+Deployment 185  (succeeded, but the release is bad)
+Deployment 186  (rollback) ── Restores: 184
 ```
 
-Mutable tags should not be treated as sufficient deployment identity when an immutable image digest is available.
+186 gets a new ID, passes the same readiness gate, starts a candidate, health-checks it, and switches traffic through the same code path as any deployment. 184's record is untouched.
+
+It restores the recorded **image digest and configuration digest**, not the image tag — the tag may now point somewhere else entirely. `LastSuccessful(application, environment)` is the query, and it is environment-scoped so that rolling production back can never find a staging deployment.
+
+The system does not assume an image alone defines deployment state.
 
 ---
 
-## 16. Rollback Model
+## 16. Secrets
 
-Rollback is a new operation that restores a previously recorded state.
+See [ADR-012](adr/ADR-012-secrets.md). Configuration holds references (`env:NAME`, `file:/path`), never values; a literal is rejected at load with a rotation hint, because by the time that error appears the value has usually already been committed.
 
-It should not erase history.
+A `Secret` type implements `String`, `GoString`, `MarshalJSON`, `MarshalYAML`, and `slog.LogValue` to return `***`. Reading the value requires an explicit `.Expose()`, which is greppable and reviewable.
 
-Example:
-
-```text
-Deployment 184
-      │
-      ▼
-Deployment 185
-      │
-      ▼
-Rollback requested
-      │
-      ▼
-Deployment 186
-      │
-      └── restores state represented by 184
-```
-
-Rollback should be validated and health-checked using the same safety mechanisms as a normal deployment.
-
-The system should avoid assuming that an application image alone defines the complete deployment state.
+**No secret enters evidence or a provenance record**, enforced structurally: no type reachable from `Record` has a `Secret` field. This matters more here than elsewhere because records are append-only — a credential in a record cannot be redacted afterwards.
 
 ---
 
-## 17. Configuration and Policy
+## 17. Observability
 
-Deployment configuration should be typed and validated.
+See [ADR-014](adr/ADR-014-observability.md).
 
-Conceptually:
+**stdout carries the result; stderr carries the log.** Nothing else is ever written to stdout, so `shiphold check --output json | jq .decision` works. `log/slog` from the standard library, constructed in the composition root and passed explicitly — no package-level global.
 
-```yaml
-application:
-  name: payments-api
+Every command producing a result supports `--output text|json`, and the JSON carries a `schema` field from the first release. Output other people's scripts consume is an interface, and an interface without a version is a promise you cannot keep.
 
-deployment:
-  target: docker
+Text output is designed rather than incidental, because for this project the terminal output *is* the user interface — it is what appears in the README and the demo.
 
-  health:
-    endpoint: /health
-    timeout: 60s
+Deployments emit a progress line per state transition. Silence during a minute-long deployment is unnerving and, in CI, indistinguishable from a hang.
 
-checks:
-  ci:
-    required: true
-
-  image:
-    required: true
-
-policy:
-  require_ci_pass: true
-  require_immutable_digest: true
-  require_healthcheck: true
-```
-
-The initial policy engine is deliberately rule-based.
-
-Rules should operate on typed domain data.
-
-Do not introduce:
-
-- custom DSLs,
-- embedded scripting,
-- arbitrary expression evaluation,
-- complex AST parsing.
-
-Configuration differences between environments should not automatically be treated as errors.
-
-The future configuration model should distinguish:
-
-```text
-Expected differences
-vs.
-Unexpected differences
-```
+Metrics, tracing, and log shipping are out of scope; ShipHold is not a monitoring platform and is not a long-running process.
 
 ---
 
-## 18. Testing Architecture
+## 18. Testing architecture
 
-Testing is a continuous engineering activity from Week 1 through Week 12.
+Testing is continuous, not a phase.
 
-It is not a final project phase.
+**Unit tests** — domain rules, policy evaluation, evidence aggregation, state transitions, configuration validation, rollback rules, canonical serialisation. No Docker, no network, milliseconds. The bulk of the suite.
 
-Every feature should follow:
+**Application tests** — orchestration against fakes for every declared port.
 
-```text
-Design
-  ↓
-Define behavior/tests
-  ↓
-Implementation
-  ↓
-Unit tests
-  ↓
-Integration tests where needed
-  ↓
-Documentation
-  ↓
-CI verification
-```
+**Adapter tests** — each infrastructure package against a fake server or a real dependency, separately.
 
-### Unit tests
+**Contract tests** — one suite run against **both** `DeploymentRepository` implementations ([ADR-010](adr/ADR-010-deployment-repository.md)). This is where the repository's real specification lives: a behaviour asserted only against PostgreSQL is a PostgreSQL detail that leaked, not part of the interface.
 
-Cover:
+**Integration tests** — build-tagged, excluded from the default `go test ./...`, using `testcontainers-go` for PostgreSQL. The default suite must run with no Docker daemon and no credentials. The file-backed repository is what makes this achievable, and it is why it exists.
 
-- domain rules,
-- policy evaluation,
-- readiness aggregation,
-- deployment state transitions,
-- diff generation,
-- configuration validation,
-- rollback rules.
+**End-to-end** — at least one full scenario against a Docker Compose fixture: commit → readiness → deployment → routing → verification → provenance → rollback.
 
-These should be fast and should not require Docker or network access.
+**Failure-path tests** — deliberately: failed CI, missing image, mutable-tag-only image, malformed policy, unknown policy key, Docker down, proxy down mid-switch, health timeout, `SIGKILL` during deploy, repository write failure, failed rollback, corrupted ledger. Each must produce a specific error, a specific exit code, and a specific provenance outcome.
 
-### Application/service tests
+The **recovery matrix** — for each combination of (record state, container state, router state), the asserted reconciliation outcome — is the highest-value test in the project. It is roughly a dozen table-driven cases, and they are the cases that decide whether the word "safety" in the product description is earned.
 
-Use fakes or mocks for:
-
-- Git provider,
-- CI provider,
-- registry provider,
-- deployment target,
-- traffic router,
-- repository.
-
-These tests verify orchestration.
-
-### Adapter tests
-
-Test concrete infrastructure behavior separately.
-
-Examples:
-
-- Git adapter
-- GitHub adapter
-- registry adapter
-- Docker adapter
-- proxy/router adapter
-- PostgreSQL adapter
-
-### Integration tests
-
-Use `testcontainers-go` where real infrastructure behavior matters.
-
-Primary candidates:
-
-- PostgreSQL,
-- disposable Docker containers,
-- complete deployment topology where practical.
-
-Testcontainers should not replace unit tests. It should validate the boundary where mocks cannot give sufficient confidence.
-
-### GitHub integration
-
-The normal CI test suite should not depend on a personal GitHub token.
-
-Use:
-
-- fake providers for service tests,
-- recorded fixtures or contract-style tests where practical,
-- explicitly configured integration tests for real GitHub API behavior.
-
-A full GitHub App is not required for the core v1 workflow.
-
-### End-to-end tests
-
-At least one complete scenario should exist:
-
-```text
-Git commit
-  ↓
-readiness checks
-  ↓
-Docker deployment
-  ↓
-proxy routing
-  ↓
-health verification
-  ↓
-audit persistence
-  ↓
-rollback
-```
-
-### Failure-path testing
-
-The project should deliberately test:
-
-- failed CI,
-- missing image,
-- invalid configuration,
-- Docker failure,
-- proxy failure,
-- health failure,
-- timeout,
-- deployment interruption,
-- persistence failure,
-- failed rollback.
+**Golden tests on canonical serialisation** from the first commit. It is a stored format; changing it invalidates every existing hash.
 
 ---
 
-## 19. CI Testing Strategy
-
-GitHub Actions should continuously run:
+## 19. CI
 
 ```text
-Formatting
-   ↓
-Static analysis
-   ↓
-Unit tests
-   ↓
-Integration tests
-   ↓
-Build
+go build  →  go vet  →  golangci-lint  →  go test -race -cover  →  coverage floor
 ```
 
-As infrastructure integration grows, the CI environment should be able to start the required disposable services/containers automatically.
+On every push. Green from Week 1.
 
-No manual machine configuration should be required for the default CI suite.
+**The coverage floor is set the day CI is set up**, even at a modest value, and raised over time. Adding a gate later, once coverage has drifted down, is a hard conversation — this is a direct lesson from DiffSage, where coverage runs but is not gated for exactly that reason.
 
----
+The dependency-rule checks from §5 run here too. The default suite requires no Docker and no credentials; integration tests run in a separate build-tagged job.
 
-## 20. Documentation as a Continuous Activity
-
-Documentation must evolve alongside implementation.
-
-Do not postpone documentation to Week 12.
-
-### `README.md`
-
-Update whenever user-visible behavior changes.
-
-### `docs/architecture.md`
-
-Update when architecture or important boundaries change.
-
-### `docs/vision.md`
-
-Update when product direction or scope changes.
-
-### ADRs
-
-Create an ADR when an important architectural decision is made.
-
-### Development documentation
-
-Update:
-
-- setup,
-- testing,
-- contribution,
-- local environment requirements.
-
-### Operations documentation
-
-Update:
-
-- deployment configuration,
-- proxy setup,
-- troubleshooting,
-- rollback,
-- failure recovery.
-
-Rule:
-
-> If implementation changes the answer to "how does this system work?", update the relevant documentation in the same development cycle.
+The toolchain is pinned to the declared language floor, not `stable`, so accidental use of a newer language feature fails in CI rather than on a contributor's machine.
 
 ---
 
-## 21. Development Workflow
+## 20. Documentation as a continuous activity
 
-Each implementation increment should follow:
+Documentation evolves with implementation. The rule:
+
+> If a change alters the answer to "how does this system work?", update the relevant documentation in the same cycle.
+
+- **`README.md`** — whenever user-visible behaviour changes. It must never describe a capability the binary does not have.
+- **`docs/architecture.md`** — when a boundary changes.
+- **`docs/vision.md`** — when product direction changes.
+- **`docs/adr/`** — when a decision is made. Not reconstructed later.
+- **`docs/roadmap.md`** — weekly.
+- **`docs/development/`, `docs/operations/`** — setup, testing, contribution; proxy setup, troubleshooting, rollback, recovery.
+
+A weekly check that every link in `README.md` and `docs/` resolves is worth the two minutes. The branch this architecture was reviewed against failed that check in six places, and every one of them was cheap to prevent.
+
+---
+
+## 21. Development workflow
 
 ```text
-1. Define problem
-2. Update scope/design if necessary
-3. Identify domain behavior
-4. Design interfaces
-5. Define tests
+1. Define the problem
+2. Update scope or design if needed
+3. Identify the domain behaviour
+4. Design the interfaces
+5. Write the tests
 6. Implement
-7. Run unit tests
-8. Run relevant integration tests
+7. Unit tests
+8. Integration tests where warranted
 9. Update documentation
-10. Update ADR if architecture changed
-11. Run full CI suite
+10. Write or update the ADR if a decision was made
+11. Full CI
 12. Commit
 ```
 
-This is intended to reproduce the strongest development practices used in DiffSage.
+Step 10 is the one that is easiest to skip and most expensive to skip. An ADR written when the decision is made captures the alternatives that were live at the time; one reconstructed later captures only the outcome, and the alternatives are the interesting part.
 
 ---
 
-## 22. Architectural Decision Records
+## 22. Architectural decision records
 
-Likely ADRs include:
+The full index is in [`docs/adr/README.md`](adr/README.md). Sixteen records, one `Proposed` (ADR-008, pending the traffic-switching spike) and the rest `Accepted`.
 
-```text
-ADR-001 Project Architecture
-ADR-002 CLI Architecture
-ADR-003 Deployment Domain Model
-ADR-004 External Provider Interfaces
-ADR-005 Docker as Initial Deployment Target
-ADR-006 PostgreSQL for Deployment Provenance
-ADR-007 Immutable Image Digests
-ADR-008 Health-Gated Deployment
-ADR-009 Reverse Proxy Traffic Switching
-ADR-010 Deployment Idempotency and Recovery
-ADR-011 Readiness Decision Model
-ADR-012 Typed YAML Policy Model
-ADR-013 AI as Explanation Layer
-ADR-014 Kubernetes Deferred to Future Adapter
-```
-
-These are candidates, not a checklist.
-
-Create an ADR when the decision is made and its tradeoffs matter.
+Records are never edited to reflect a change of mind. A reversed decision becomes `Superseded by ADR-NNN`, and the new record explains what changed. A superseded ADR is evidence of learning.
 
 ---
 
-## 23. Extension Strategy
+## 23. Extension strategy
 
-The architecture should make future expansion additive.
-
-### New deployment target
+Expansion should be additive.
 
 ```text
-DeploymentTarget
-├── DockerDeploymentTarget
-└── KubernetesDeploymentTarget
+DeploymentTarget          TrafficRouter           CIProvider
+├── DockerTarget          ├── TraefikFileRouter   ├── GitHubActions
+└── KubernetesTarget ✦    └── CaddyRouter ✦       └── GitLabCI ✦
+
+RegistryProvider          DeploymentRepository
+├── GHCR                  ├── FileRepository      ← both in v1
+└── ECR ✦                 └── PostgresRepository
+
+✦ = post-v1 (extended-scope.md)
 ```
 
-### New traffic router
+`DeploymentRepository` ships with two implementations in v1, deliberately. The DiffSage playbook's rule is that "an interface shaped by one implementation is a guess; shaped by two, it's tested," and the repository is the seam where the second implementation is cheapest — half a day — and pays for itself immediately by making the whole test suite runnable without Docker.
 
-```text
-TrafficRouter
-├── TraefikRouter
-└── FutureRouter
-```
+The other three seams ship with one implementation each, and their ADRs say so explicitly, naming what the second would be and which parts of the signature exist because of it. Designing against a hypothetical second implementation and *saying that is what you did* is defensible; shaping an interface around one implementation and calling it an abstraction is not.
 
-### New CI provider
-
-```text
-CIProvider
-├── GitHubActionsProvider
-└── GitLabCIProvider
-```
-
-### New registry
-
-```text
-RegistryProvider
-├── GHCRProvider
-└── ECRProvider
-```
-
-### AI
-
-An explanation provider can consume existing readiness results.
-
-### GitOps
-
-Future GitOps functionality can consume the existing deployment/provenance model rather than creating a second deployment model.
+Future GitOps functionality would consume the existing deployment and provenance model rather than introducing a second one.
 
 ---
 
-## 24. Architectural Quality Bar
+## 24. Architectural quality bar
 
-The project should be considered well-founded when:
+The foundation is sound when:
 
-- domain logic can be tested without Docker;
-- application services can be tested without GitHub;
-- provider adapters can be replaced;
+- domain logic is testable without Docker, a network, or a database;
+- the default test suite runs in seconds with no infrastructure;
+- application services are testable without GitHub;
+- the dependency rule is enforced in CI, not merely documented;
+- provider adapters are replaceable, and at least one seam proves it with two implementations;
 - traffic routing is isolated from deployment orchestration;
-- deployment history has a stable domain representation;
-- deployment failures have explicit states;
-- rollback is modeled as a real operation;
-- CLI commands remain thin;
-- configuration is validated at boundaries;
-- tests cover both success and failure paths;
-- integration tests exercise important real infrastructure boundaries;
-- documentation describes the current architecture;
-- architectural decisions are recorded when they matter;
-- the default CI suite is reproducible.
+- every failure mode has an explicit state, an exit code, and a provenance outcome;
+- an interrupted deployment is detected and either completed or reverted, and never guessed at;
+- rollback is a real operation that preserves history;
+- the provenance chain is verifiable by a command;
+- a recorded decision is reproducible from its recorded evidence, offline;
+- CLI commands remain thin and no command exits 0 on a negative verdict;
+- configuration is validated strictly and a typo fails closed;
+- no document describes a capability the binary does not have.
 
-The objective is not to create a perfect architecture upfront.
-
-The objective is to create an architecture that can evolve safely.
+The objective is not a perfect architecture upfront. It is an architecture that can evolve safely — and, for this project specifically, one whose claims a reader can check.
 
 ---
 
-## 25. Three-Month Architectural Milestones
+## 25. Milestones
 
-### Calendar mapping
-
-The week numbers below are effort-based, not calendar weeks. They map onto real availability as follows:
-
-```text
-Now → mid-November (partial time)
-   Week 1 only — spikes, Go fundamentals, domain design,
-   ADR-001 through ADR-004 drafted incrementally.
-
-Mid-November → late December (full commitment)
-   Weeks 2–11 — this is where the bulk of implementation
-   happens, compressed into ~6 weeks of full focus rather
-   than spread thin across the calendar.
-
-After that
-   Week 12 — hardening and release, time permitting before
-   applications are due.
-```
-
-If full commitment weeks run short, the honest fallback is to treat Weeks 2–6 (readiness through Docker deployment) as the interview-ready checkpoint, with provenance, rollback, and hardening documented as in-progress via their ADRs rather than rushed to completion.
-
-### Week 1 — Foundation + Technical Spikes
-
-- repository
-- Go module
-- CLI skeleton
-- configuration
-- logging
-- error strategy
-- test infrastructure
-- CI
-- initial documentation
-- reverse proxy spike
-- Docker deployment topology spike
-- Testcontainers proof of concept
-
-Deliverable:
-
-A validated technical direction before the core deployment engine is built.
-
-### Weeks 2–3 — Readiness
-
-- domain models
-- provider interfaces
-- Git adapter
-- CI adapter
-- registry adapter
-- readiness service
-- policy model
-
-Tests and documentation are updated alongside each feature.
-
-### Week 4 — Deployment Diff and Policy
-
-- deployment diff
-- typed YAML policies
-- deterministic policy evaluation
-- CLI output
-- tests
-- documentation
-
-### Weeks 5–6 — Docker Deployment
-
-- deployment state machine
-- Docker adapter
-- proxy/router adapter
-- blue/green-style health-gated deployment
-- traffic switch
-- failure handling
-- integration tests
-- end-to-end deployment tests
-- operational documentation
-
-### Weeks 7–8 — Provenance
-
-- PostgreSQL schema
-- repository interface
-- persistence adapter
-- history
-- deployment inspection
-- Testcontainers integration tests
-- documentation
-
-### Week 9 — Rollback and Recovery
-
-- rollback model
-- rollback service
-- state reconstruction
-- health verification
-- interrupted-deployment handling
-- idempotency checks
-- failure tests
-- documentation
-
-### Weeks 10–11 — Hardening
-
-This is not the beginning of testing.
-
-Instead, these weeks focus on expanding confidence:
-
-- failure-path coverage
-- integration/E2E coverage
-- proxy failure scenarios
-- Docker failure scenarios
-- persistence failure scenarios
-- CLI quality
-- error handling
-- configuration validation
-- documentation review
-- architecture review
-- ADR review
-
-### Week 12 — Release
-
-No major new feature.
-
-- final test suite
-- end-to-end demo
-- README refinement
-- architecture documentation
-- operations documentation
-- example configuration
-- release notes
-- v1.0.0
+See [`docs/roadmap.md`](roadmap.md). The schedule lives there so that this document can describe the system rather than the calendar, and so that a slipped week does not make the architecture document stale.
 
 ---
 
-## 26. Definition of Foundation Complete
+## 26. Definition of foundation complete
 
-The foundation is complete when future work can be added through existing boundaries.
-
-For example:
+The foundation is complete when future work arrives through existing boundaries.
 
 ```text
-                    Core Engine
-                         │
-        ┌────────────────┼─────────────────┐
-        ▼                ▼                 ▼
-   Readiness         Deployment         Provenance
-        │                │                 │
-   ┌────┴────┐      ┌────┴────┐       PostgreSQL
-   ▼         ▼      ▼         ▼
- GitHub    Future  Docker   Kubernetes
- Actions   CI      Target     future
+                        Core Engine
+                             │
+        ┌────────────────────┼────────────────────┐
+        ▼                    ▼                    ▼
+   Readiness            Deployment           Provenance
+        │                    │                    │
+   ┌────┴────┐          ┌────┴────┐          ┌────┴────┐
+   ▼         ▼          ▼         ▼          ▼         ▼
+ GitHub   Future     Docker   Kubernetes   File    Postgres
+ Actions    CI       Target     future
 ```
 
-Future capabilities should primarily be additions to adapters, policies, application services, or presentation layers—not rewrites of the domain.
+Future capability should be additions to adapters, policies, services, or presentation — not rewrites of the domain.
 
 ---
 
-## 27. Definition of Done for Any Feature
+## 27. Definition of done
 
-A feature is not considered complete merely because its code works.
-
-A feature is complete when the relevant parts of:
+A feature is not complete because its code works. It is complete when the relevant parts of:
 
 ```text
-Domain behavior
-+
-Implementation
-+
-Tests
-+
-Documentation
-+
-CI verification
+Domain behaviour + Implementation + Tests + Documentation + CI verification
 ```
 
-are present.
+are present and aligned. The test level depends on the feature; the documentation depends on whether it changes architecture, configuration, operations, or user behaviour.
 
-The exact test level depends on the feature.
-
-The exact documentation depends on whether it changes architecture, configuration, operations, or user behavior.
-
-This standard applies throughout the project, from Week 1 to v1.0.
+This applies from Week 1 to v1.0.
